@@ -1,0 +1,12 @@
+# Crontab configuration for the main Proxmox host
+# Install with: crontab -e
+# (paste the two lines below, adjusting the schedule to your needs)
+
+# Run the backup workflow every day at 1:00 PM.
+# stdout/stderr are redirected to a log file for later inspection.
+0 13 * * * /path/to/backup-green.sh > /var/log/backup-green.log 2>&1
+
+# Nightly "eco-sleep": fully power off the main host at midnight and
+# schedule a hardware wake-up 7 hours later (25200 seconds) via the RTC chip.
+# Adjust -s to match your own sleep window.
+0 0 * * * /usr/sbin/rtcwake -m off -s 25200

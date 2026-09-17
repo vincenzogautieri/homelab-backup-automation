@@ -1,72 +1,206 @@
-# Homelab Power-Cycle Automation
+# Homelab Backup Automation
 
 🇬🇧 [Read in English](README.md)
 
-Uno script Bash di automazione che orchestra l'intero ciclo di alimentazione di un homelab basato su Proxmox: l'host principale si sospende e si risveglia da solo secondo una pianificazione notturna, mentre un server di backup separato viene risvegliato on-demand tramite Wake-on-LAN una volta al giorno per eseguire un backup, verificarne l'integrità, liberare spazio disco e spegnersi di nuovo autonomamente. Insieme, queste due pianificazioni mantengono l'intera infrastruttura a un consumo prossimo agli 0 W per circa 23 ore e mezza al giorno.
+> Automazione Bash per un homelab Proxmox che coordina gestione dell'alimentazione del server di backup, backup automatici, verifica dell'integrità, retention PBS, garbage collection e spegnimento.
 
-Originariamente parte di un progetto più ampio di [infrastruttura homelab](https://github.com/vincenzogautieri/homelab-selfhosted); estratto qui come esempio autonomo di automazione e orchestrazione infrastrutturale.
+Questa repository contiene la versione standalone dello script di automazione estratto dal progetto infrastrutturale [`homelab-selfhosted`](https://github.com/vincenzogautieri/homelab-selfhosted).
+
+Lo script è progettato per essere eseguito automaticamente sull'host principale Proxmox e coordina l'intero ciclo giornaliero di backup di un Proxmox Backup Server (PBS) normalmente spento.
 
 ## Cosa fa
 
-Lo script (`power-cycle.sh`) esegue una sequenza fissa di sei passaggi, con gestione degli errori a ogni fase:
+Lo script (`backup-orchestrator.sh`) esegue un workflow deterministico composto da sei fasi:
 
-1. **Risveglio** — invia un magic packet Wake-on-LAN all'interfaccia di rete del server di backup.
-2. **Attesa** — controlla la disponibilità del server via ping per un massimo di 3 minuti; termina con un errore se non risponde in tempo, invece di procedere alla cieca.
-3. **Backup** — esegue `vzdump` su tutte le VM/container LXC, con una politica di retention integrata (mantiene gli ultimi 7 giornalieri, 4 settimanali, 1 mensile).
-4. **Verifica** — avvia un Verify Job di Proxmox Backup Server per controllare l'integrità a livello di blocco dei dati appena scritti.
-5. **Garbage collection** — libera spazio disco rimuovendo fisicamente i blocchi di dati orfani non più referenziati da alcun backup.
-6. **Spegnimento** — spegne il server di backup da remoto via SSH, solo dopo che tutti i passaggi precedenti sono andati a buon fine.
+1. **Wake** — invia un pacchetto Wake-on-LAN al server di backup.
+2. **Wait** — attende che PBS diventi raggiungibile, con un timeout massimo.
+3. **Backup** — esegue `vzdump` su tutte le VM e i container LXC Proxmox.
+4. **Verify** — avvia il job PBS configurato per la verifica dell'integrità.
+5. **Prune & Garbage Collection** — applica la retention configurata su PBS e libera lo spazio non più utilizzato.
+6. **Shutdown** — spegne remotamente il server di backup tramite SSH.
 
-## Il quadro generale: un ciclo di alimentazione completamente deterministico
+Il workflow è progettato per essere eseguito senza intervento manuale tramite `cron`.
 
-Questo script è metà di una strategia energetica a doppio binario:
+## Architettura
 
-- **Host principale**: resta acceso, ma viene messo in sospensione profonda ogni notte (`rtcwake -m off -s 25200`) e si risveglia da solo tramite l'orologio hardware RTC dopo una finestra fissa — di notte non avviene nessun backup o manutenzione, quindi non ha senso tenerlo acceso.
-- **Server di backup**: resta completamente spento (0 W) per praticamente tutta la giornata, e viene risvegliato on-demand, una volta al giorno, solo per i pochi minuti necessari a completare i passaggi 1-6 sopra descritti.
+```text
+                    Main Proxmox Host
+                         │
+                         │ cron — 13:00
+                         ▼
+                 ┌─────────────────┐
+                 │  power-cycle.sh │
+                 └────────┬────────┘
+                          │
+                          │ Wake-on-LAN
+                          ▼
+                 ┌─────────────────┐
+                 │ Proxmox Backup  │
+                 │ Server (PBS)    │
+                 └────────┬────────┘
+                          │
+              ┌───────────┼───────────┐
+              │           │           │
+              ▼           ▼           ▼
+           Backup      Verify      Prune
+              │           │           │
+              └───────────┼───────────┘
+                          │
+                          ▼
+                  Garbage Collection
+                          │
+                          ▼
+                       Shutdown
+```
 
-Entrambe le pianificazioni sono gestite da cron sull'host principale (vedi `crontab.example`), quindi l'intero ciclo — sospensione, risveglio, backup, verifica, pulizia, spegnimento — non richiede alcun intervento manuale.
+## Workflow di backup
 
-## Perché questo design
+### 1. Accensione del server di backup
 
-- **Tolleranza ai guasti anziché esecuzione alla cieca**: lo script non lancia semplicemente comandi sperando che vadano bene; attende attivamente che il server di backup sia raggiungibile prima di toccarlo, e fallisce in modo esplicito (`exit 1`) se non lo è, invece di eseguire comandi di backup contro un server che non è ancora disponibile.
-- **Politica di retention idempotente**: il pruning è gestito dal flag nativo `--prune-backups` di `vzdump` invece che da uno script di pulizia separato, mantenendo la logica di retention in un unico punto.
-- **Gestione completa del ciclo di vita**: lo script non si limita a "eseguire un backup" — gestisce l'intero ciclo di vita della macchina di destinazione, dall'accensione allo spegnimento, trattando il server di backup come una risorsa on-demand piuttosto che sempre attiva.
-- **Osservabilità**: ogni passaggio registra una riga di stato numerata chiaramente (`[1/6]`, `[2/6]`, ...) per rendere immediato capire, dal solo file di log, esattamente dove si sia interrotta un'esecuzione fallita.
+Wake-on-LAN viene utilizzato per accendere PBS solamente quando sono necessarie le operazioni di backup e manutenzione.
 
-## Requisiti
+Lo script invia il magic packet attraverso il bridge di rete Proxmox configurato:
 
-- Un host Proxmox VE (lo script presuppone la disponibilità di `vzdump` e degli strumenti in stile `pct`)
-- Una seconda macchina con Proxmox Backup Server (PBS), raggiungibile in rete e configurata per accettare il Wake-on-LAN
-- `etherwake` installato sull'host principale (`apt install etherwake`)
-- Accesso SSH basato su chiave dall'host principale al server di backup (per permettere l'esecuzione non interattiva)
-- Un Verify Job configurato su PBS (va creato prima dalla web UI di PBS, poi se ne annota l'ID)
+```bash
+etherwake -i "$INTERFACE" "$PBS_MAC"
+```
 
-## Configurazione
+### 2. Attesa della disponibilità di PBS
 
-1. Copia `power-cycle.sh` sull'host Proxmox principale (es. `/root/power-cycle.sh`) e rendilo eseguibile:
-   ```bash
-   chmod +x power-cycle.sh
-   ```
-2. Modifica il blocco di configurazione in cima allo script con i tuoi valori reali:
-   ```bash
-   PBS_IP="<IP_SERVER_BACKUP>"
-   PBS_MAC="<MAC_ADDRESS_SERVER_BACKUP>"
-   DATASTORE="backup-datastore"
-   VERIFY_JOB_ID="<ID_VERIFY_JOB_PBS>"
-   INTERFACE="vmbr0"
-   ```
-3. Testalo manualmente per primo:
-   ```bash
-   ./power-cycle.sh
-   ```
-4. Una volta che gira correttamente dall'inizio alla fine, pianificalo con cron — vedi `crontab.example` per una configurazione pronta da adattare, che copre sia il job di backup sia il ciclo di sospensione notturna dell'host principale.
+Lo script verifica periodicamente l'indirizzo IP configurato di PBS fino a quando il server diventa raggiungibile.
 
-## Controlli di integrità
+La configurazione predefinita attende per circa tre minuti:
 
-- La riga di log `[OK] Server is responding to ping!` dovrebbe apparire ben entro la finestra di 3 minuti (tipicamente dopo 9-12 tentativi di polling) — un'attesa molto più lunga può indicare che il server di backup non si sta risvegliando correttamente dalla sospensione.
-- I timestamp nell'interfaccia web di Proxmox Backup Server e nei file di indice sono registrati in UTC (suffisso `Z`) — è un comportamento previsto e non richiede alcuna correzione manuale del fuso orario.
-- Poiché l'intero ciclo di vita è gestito da remoto da questo script, le pianificazioni native di PBS per Prune/GC e Verify Jobs possono essere lasciate disabilitate ("No Schedule Set") nella sua web UI — vengono invece attivate on-demand.
+```text
+36 tentativi × 5 secondi
+```
 
-## Nota di sicurezza
+Quando il server risponde, viene utilizzato un ulteriore periodo di attesa per permettere ai servizi Proxmox e PBS di completare l'avvio.
 
-`PBS_MAC`, `PBS_IP` e `VERIFY_JOB_ID` in questo repository sono placeholder. Sostituiscili con i tuoi valori reali solo in locale — non caricare mai MAC address reali, IP interni o identificativi di infrastruttura su un repository pubblico.
+### 3. Esecuzione dei backup Proxmox
+
+Tutti i guest Proxmox attuali e futuri vengono selezionati automaticamente:
+
+```bash
+vzdump --all 1
+```
+
+I backup vengono inviati allo storage PBS configurato su Proxmox:
+
+```text
+pbs-backup
+```
+
+La directory contenente i modelli Ollama viene esclusa esplicitamente:
+
+```text
+/var/lib/docker/volumes/ollama_ollama_data/_data/models/*
+```
+
+In questo modo non vengono copiati inutilmente grandi file di modelli AI che possono essere eventualmente riscaricati.
+
+La retention **non viene gestita da `vzdump`**.
+
+La retention viene invece gestita direttamente da Proxmox Backup Server tramite un apposito PBS Prune Job.
+
+### 4. Verifica dell'integrità
+
+Dopo il completamento del backup viene avviato il job PBS configurato:
+
+```bash
+proxmox-backup-manager verify-job run "$VERIFY_JOB_ID"
+```
+
+Se la verifica fallisce, lo script si interrompe e lascia intenzionalmente PBS acceso per consentire una diagnosi manuale.
+
+### 5. Retention e garbage collection
+
+Il PBS Prune Job viene eseguito per applicare la politica di retention configurata sul datastore:
+
+```bash
+proxmox-backup-manager prune-job run "$PRUNE_JOB_ID"
+```
+
+L'infrastruttura attuale utilizza:
+
+* Keep Last: 3
+* Keep Daily: 7
+* Keep Weekly: 4
+* Keep Monthly: 6
+* Keep Yearly: 1
+
+Successivamente viene eseguita la garbage collection sul datastore configurato:
+
+```bash
+proxmox-backup-manager garbage-collection start "$DATASTORE"
+```
+
+Prune e garbage collection sono quindi gestiti separatamente dalla creazione dei backup tramite `vzdump`.
+
+### 6. Spegnimento di PBS
+
+Al termine del workflow PBS viene spento remotamente:
+
+```bash
+shutdown -h now
+```
+
+In questo modo il server di backup rimane spento quando non è necessario.
+
+## Strategia di gestione energetica
+
+L'automazione fa parte di una più ampia strategia di riduzione dei consumi dell'infrastruttura.
+
+### Host principale Proxmox
+
+L'host principale viene spento ogni notte tramite:
+
+```bash
+rtcwake -m off -s 25200
+```
+
+L'allarme RTC provvede a riaccenderlo dopo circa sette ore.
+
+### Backup server
+
+Il nodo PBS rimane normalmente spento e viene acceso solamente quando viene eseguito il workflow giornaliero di backup.
+
+In questo modo si riducono i consumi durante le ore in cui il server non è necessario, mantenendo comunque un sistema di backup completamente automatizzato.
+
+## Scheduling
+
+Il workflow di backup viene eseguito ogni giorno alle 13:00:
+
+```cron
+0 13 * * * /root/power-cycle.sh
+```
+
+Il ciclo notturno dell'host principale viene eseguito a mezzanotte:
+
+```cron
+00 00 * * * /usr/sbin/rtcwake -m off -s 25200
+```
+
+Per un esempio completo consulta [`crontab.example`](crontab.example).
+
+## Relazione con il progetto principale
+
+Questa repository è l'estrazione standalone dell'automazione di backup e gestione energetica implementata nel progetto:
+
+**[`vincenzogautieri/homelab-selfhosted`](https://github.com/vincenzogautieri/homelab-selfhosted)**
+
+Il progetto principale documenta l'intera infrastruttura, inclusi:
+
+* Proxmox VE
+* Proxmox Backup Server
+* container LXC
+* Docker
+* Tailscale
+* AdGuard Home
+* Nginx Proxy Manager
+* Nextcloud
+* n8n
+* Ollama
+* strumenti di amministrazione e monitoraggio
+
+Questa repository si concentra esclusivamente sul componente di automazione del backup e del power-cycle.
